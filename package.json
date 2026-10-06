@@ -1,0 +1,13 @@
+{
+  "name": "story-loom",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "serve": "python3 -m http.server 4173"
+  },
+  "devDependencies": {
+    "jsdom": "^30.0.1"
+  }
+}

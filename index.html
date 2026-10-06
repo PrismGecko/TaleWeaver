@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+    />
+    <meta
+      name="description"
+      content="A local-first narrative writing and roleplay workspace for OpenRouter."
+    />
+    <title>Story Loom</title>
+    <meta name="theme-color" content="#0c0d12" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Story Loom" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="app-bar">
+        <button id="story-button" class="story-button" type="button">
+          <span id="story-title" class="story-title">Untitled story</span>
+          <span class="story-caret" aria-hidden="true">⌄</span>
+        </button>
+        <span id="save-status" class="save-status" aria-live="polite"></span>
+        <button
+          id="settings-button"
+          class="icon-button"
+          type="button"
+          aria-label="Settings"
+        >
+          ⋯
+        </button>
+      </header>
+
+      <nav id="scene-bar" class="scene-bar" aria-label="Story context">
+        <button id="branch-chip" class="chip" type="button">
+          <span class="chip-icon" aria-hidden="true">⑂</span>
+          <span id="branch-chip-label">Main thread</span>
+        </button>
+        <button id="scene-chip" class="chip" type="button">
+          <span class="chip-icon" aria-hidden="true">◈</span>
+          <span id="scene-chip-label">Set the scene</span>
+        </button>
+        <button id="world-chip" class="chip" type="button">
+          <span class="chip-icon" aria-hidden="true">✦</span>
+          <span>World</span>
+        </button>
+      </nav>
+
+      <main id="transcript" class="transcript" aria-live="polite"></main>
+
+      <form id="composer" class="composer">
+        <div id="composer-mode" class="composer-mode hidden">
+          <span id="composer-mode-label"></span>
+          <button
+            id="composer-mode-clear"
+            class="composer-mode-clear"
+            type="button"
+            aria-label="Write as yourself again"
+          >
+            ×
+          </button>
+        </div>
+        <p id="composer-error" class="composer-error" role="alert"></p>
+        <div class="composer-row">
+          <button
+            id="composer-more"
+            class="composer-button"
+            type="button"
+            aria-label="More writing options"
+          >
+            ＋
+          </button>
+          <textarea
+            id="composer-input"
+            name="content"
+            rows="1"
+            placeholder="Continue the story…"
+            enterkeyhint="send"
+          ></textarea>
+          <button
+            id="stop-button"
+            class="composer-button composer-stop hidden"
+            type="button"
+            aria-label="Stop generating"
+          >
+            ■
+          </button>
+          <button
+            id="send-button"
+            class="composer-button composer-send"
+            type="submit"
+            aria-label="Send"
+          >
+            ↑
+          </button>
+        </div>
+      </form>
+    </div>
+
+    <input id="import-file" class="hidden" type="file" accept="application/json,.json" />
+    <div id="toast-region" class="toast-region" aria-live="polite"></div>
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>
