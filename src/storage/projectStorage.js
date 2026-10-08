@@ -1,7 +1,16 @@
 import { normalizeProject } from "../models/storyProject.js";
-import { idbGet, idbRemove, idbSet, isIdbAvailable } from "./db.js";
+import { createId } from "../utils/id.js";
+import {
+  idbCompareAndSet,
+  idbGet,
+  idbGetMany,
+  idbRemove,
+  idbSet,
+  isIdbAvailable,
+} from "./db.js";
 
 export const PROJECTS_KEY = "story-loom.projects.v1";
+export const PROJECT_TOKENS_KEY = "story-loom.project-tokens.v1";
 const ACTIVE_PROJECT_KEY = "story-loom.active-project.v1";
 const API_KEY_STORAGE_KEY = "story-loom.openrouter-key.v1";
 const FAL_KEY_STORAGE_KEY = "story-loom.fal-key.v1";
@@ -234,19 +243,26 @@ export async function initDurableStorage(storage) {
 }
 
 export async function loadProjectsDurable(storage) {
+  const { projects, dataLoss, tokens } = await readStored(storage);
+  recordSync(projects, tokens);
+  return { projects, dataLoss };
+}
+
+async function readStored(storage) {
   if (durableBackend === "idb") {
     let raw;
+    let tokens;
     try {
-      raw = await idbGet(PROJECTS_KEY);
+      [raw, tokens] = await idbGetMany([PROJECTS_KEY, PROJECT_TOKENS_KEY]);
     } catch {
       durableBackend = isStorageAvailable(storage) ? "local" : "none";
-      return loadProjects(storage);
+      return readStored(storage);
     }
     if (raw === undefined || raw === null) {
-      return { projects: [], dataLoss: false };
+      return { projects: [], dataLoss: false, tokens: asTokens(tokens) };
     }
     if (!Array.isArray(raw)) {
-      return { projects: [], dataLoss: true };
+      return { projects: [], dataLoss: true, tokens: asTokens(tokens) };
     }
     const projects = [];
     let dropped = false;
@@ -257,22 +273,58 @@ export async function loadProjectsDurable(storage) {
         dropped = true;
       }
     }
-    return { projects, dataLoss: dropped };
+    return { projects, dataLoss: dropped, tokens: asTokens(tokens) };
   }
-  return loadProjects(storage);
+  return { ...loadProjects(storage), tokens: readLocalTokens(storage) };
 }
 
+/**
+ * Save every project, unless another tab has saved since this one last
+ * synced — then nothing is written and `conflict` is set, so the caller can
+ * merge with mergeWithStored() and try again.
+ */
 export async function saveProjectsDurable(projects, storage) {
+  const serialized = projects.map((project) => JSON.stringify(project));
+  const tokens = Object.fromEntries(
+    projects.map((project, index) => [
+      project.project_id,
+      hashString(serialized[index]),
+    ]),
+  );
+  const payload = `[${serialized.join(",")}]`;
+
   if (durableBackend === "idb") {
     try {
-      // JSON round-trip guarantees a structured-cloneable plain snapshot.
-      await idbSet(PROJECTS_KEY, JSON.parse(JSON.stringify(projects)));
-      return { ok: true, quotaExceeded: false };
+      const wrote = await idbCompareAndSet(
+        PROJECT_TOKENS_KEY,
+        (stored) => sameTokens(asTokens(stored), seenTokens),
+        // JSON round-trip guarantees a structured-cloneable plain snapshot.
+        [
+          [PROJECTS_KEY, JSON.parse(payload)],
+          [PROJECT_TOKENS_KEY, tokens],
+        ],
+      );
+      if (!wrote) return { ok: false, quotaExceeded: false, conflict: true };
+    } catch (error) {
+      return { ok: false, quotaExceeded: isQuotaError(error) };
+    }
+  } else {
+    const target = resolveStorage(storage);
+    if (!target) return { ok: false, quotaExceeded: false };
+    if (!sameTokens(readLocalTokens(target), seenTokens)) {
+      return { ok: false, quotaExceeded: false, conflict: true };
+    }
+    try {
+      target.setItem(PROJECTS_KEY, payload);
+      target.setItem(PROJECT_TOKENS_KEY, JSON.stringify(tokens));
     } catch (error) {
       return { ok: false, quotaExceeded: isQuotaError(error) };
     }
   }
-  return saveProjects(projects, storage);
+
+  seenTokens = tokens;
+  syncedHashes = new Map(Object.entries(tokens));
+  return { ok: true, quotaExceeded: false };
 }
 
 export async function clearAllLocalDataDurable(storage) {
@@ -280,10 +332,198 @@ export async function clearAllLocalDataDurable(storage) {
   if (durableBackend === "idb") {
     try {
       await idbRemove(PROJECTS_KEY);
+      await idbRemove(PROJECT_TOKENS_KEY);
     } catch {
       // Best effort, matching clearAllLocalData.
     }
   }
+  seenTokens = {};
+  syncedHashes = new Map();
+}
+
+// --- Several tabs, one story list --------------------------------------
+// Every save rewrites the whole project list, so a tab holding stale data
+// (a phone tab left open since yesterday) would silently overwrite work done
+// in another. Each save therefore also stores a token per project — a hash of
+// what was written — and only goes through while the stored tokens are still
+// the ones this tab last saw. Otherwise the two copies are merged first.
+
+// project id -> token in storage when this tab last loaded or saved.
+let seenTokens = {};
+// project id -> hash of this tab's own copy at that moment.
+let syncedHashes = new Map();
+
+function recordSync(projects, tokens) {
+  seenTokens = { ...tokens };
+  syncedHashes = new Map(
+    projects.map((project) => [
+      project.project_id,
+      hashString(JSON.stringify(project)),
+    ]),
+  );
+}
+
+/** Whether another tab has saved since this one last loaded or saved. */
+export async function hasExternalChanges(storage) {
+  let stored;
+  if (durableBackend === "idb") {
+    try {
+      stored = asTokens(await idbGet(PROJECT_TOKENS_KEY));
+    } catch {
+      return false;
+    }
+  } else {
+    stored = readLocalTokens(storage);
+  }
+  return !sameTokens(stored, seenTokens);
+}
+
+/**
+ * Fold whatever other tabs saved into this tab's projects. Projects only one
+ * side touched take that side's copy; a project both sides changed is kept
+ * twice — this tab's under its own id, the other's as a copy — so nothing is
+ * lost. Leaves this tab synced with storage except for its own unsaved work.
+ */
+export async function mergeWithStored(projects, storage) {
+  const stored = await readStored(storage);
+  const theirTokens = stored.tokens;
+  const result = mergeProjectSets({
+    ours: projects,
+    theirs: stored.projects,
+    wasSynced: (id) => syncedHashes.has(id),
+    oursChanged: (project) =>
+      hashString(JSON.stringify(project)) !==
+      syncedHashes.get(project.project_id),
+    theirsChanged: (id) => theirTokens[id] !== seenTokens[id],
+  });
+
+  seenTokens = { ...theirTokens };
+  // Copies this tab kept retain their old baseline, so unsaved changes still
+  // count as changed and the next save writes them. Deletions made here keep
+  // theirs too, so a second merge before that save doesn't resurrect them.
+  const fromStorage = new Set(stored.projects);
+  const live = new Set([
+    ...stored.projects.map((project) => project.project_id),
+    ...result.projects.map((project) => project.project_id),
+  ]);
+  const nextHashes = new Map(
+    [...syncedHashes].filter(([id]) => live.has(id)),
+  );
+  for (const project of result.projects) {
+    if (fromStorage.has(project)) {
+      nextHashes.set(project.project_id, hashString(JSON.stringify(project)));
+    }
+  }
+  syncedHashes = nextHashes;
+  return result;
+}
+
+/** Pure three-way merge at project granularity; see mergeWithStored. */
+export function mergeProjectSets({
+  ours,
+  theirs,
+  wasSynced,
+  oursChanged,
+  theirsChanged,
+}) {
+  const theirsById = new Map(theirs.map((project) => [project.project_id, project]));
+  const ourIds = new Set(ours.map((project) => project.project_id));
+  const projects = [];
+  const conflicts = [];
+  let adopted = false;
+  let localChanges = false;
+
+  const keepOurs = (project) => {
+    projects.push(project);
+    localChanges = true;
+  };
+
+  for (const project of ours) {
+    const id = project.project_id;
+    const other = theirsById.get(id);
+    const changedHere = oursChanged(project);
+    if (!other) {
+      // New in this tab, or deleted in another. A deletion wins only over a
+      // copy nobody touched here.
+      if (!wasSynced(id) || changedHere) keepOurs(project);
+      else adopted = true;
+      continue;
+    }
+    if (!theirsChanged(id)) {
+      if (changedHere) keepOurs(project);
+      else projects.push(project);
+      continue;
+    }
+    adopted = true;
+    if (!changedHere) {
+      projects.push(other);
+      continue;
+    }
+    keepOurs(project);
+    const copy = {
+      ...other,
+      project_id: createId("project"),
+      title: `${other.title} (from another tab)`,
+    };
+    projects.push(copy);
+    conflicts.push(project.title);
+  }
+
+  for (const project of theirs) {
+    const id = project.project_id;
+    if (ourIds.has(id)) continue;
+    if (wasSynced(id) && !theirsChanged(id)) {
+      // Deleted in this tab and untouched elsewhere: stays deleted, which
+      // still needs saving.
+      localChanges = true;
+      continue;
+    }
+    projects.push(project);
+    adopted = true;
+  }
+
+  return { projects, conflicts, adopted, localChanges };
+}
+
+function readLocalTokens(storage) {
+  const target = resolveStorage(storage);
+  if (!target) return {};
+  try {
+    return asTokens(JSON.parse(target.getItem(PROJECT_TOKENS_KEY) || "{}"));
+  } catch {
+    return {};
+  }
+}
+
+function asTokens(value) {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value
+    : {};
+}
+
+function sameTokens(left, right) {
+  const leftKeys = Object.keys(left);
+  return (
+    leftKeys.length === Object.keys(right).length &&
+    leftKeys.every((key) => left[key] === right[key])
+  );
+}
+
+// cyrb53: a fast 53-bit string hash. Only used to notice that a project
+// changed, never for anything security-sensitive.
+function hashString(text) {
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    h1 = Math.imul(h1 ^ code, 2654435761);
+    h2 = Math.imul(h2 ^ code, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507);
+  h1 ^= Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507);
+  h2 ^= Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
 }
 
 export function clearAllLocalData(storage) {
@@ -291,6 +531,7 @@ export function clearAllLocalData(storage) {
   if (!target) return;
   for (const key of [
     PROJECTS_KEY,
+    PROJECT_TOKENS_KEY,
     ACTIVE_PROJECT_KEY,
     API_KEY_STORAGE_KEY,
     FAL_KEY_STORAGE_KEY,

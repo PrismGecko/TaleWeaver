@@ -7,6 +7,7 @@ export async function sendChatCompletion({
   messages,
   temperature = 0.8,
   maxTokens = 1200,
+  stop = [],
   signal,
 }) {
   const response = await requestCompletion({
@@ -15,6 +16,7 @@ export async function sendChatCompletion({
     messages,
     temperature,
     maxTokens,
+    stop,
     stream: false,
     signal,
   });
@@ -37,6 +39,7 @@ export async function streamChatCompletion({
   messages,
   temperature = 0.8,
   maxTokens = 1200,
+  stop = [],
   onToken = () => {},
   signal,
   stallTimeoutMs = DEFAULT_STALL_TIMEOUT_MS,
@@ -47,6 +50,7 @@ export async function streamChatCompletion({
     messages,
     temperature,
     maxTokens,
+    stop,
     stream: true,
     signal,
   });
@@ -61,6 +65,7 @@ export async function streamChatCompletion({
       messages,
       temperature,
       maxTokens,
+      stop,
       signal,
     });
   }
@@ -162,6 +167,7 @@ async function requestCompletion({
   messages,
   temperature,
   maxTokens,
+  stop,
   stream,
   signal,
 }) {
@@ -175,6 +181,7 @@ async function requestCompletion({
         messages,
         temperature,
         max_tokens: maxTokens,
+        ...(stop?.length ? { stop } : {}),
         stream,
         usage: { include: true },
       }),

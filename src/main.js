@@ -10,14 +10,23 @@ import {
 import {
   addMessage,
   addMessageVersion,
+  appendToMessage,
   deleteMessage,
   editMessage,
   forkBranch,
   getActiveVersionIndex,
   getMessageVersions,
+  imageKeyFor,
+  isImageReferenced,
   setActiveMessageVersion,
 } from "./services/branchService.js";
-import { assembleContext } from "./services/contextAssembler.js";
+import {
+  assembleContext,
+  cutAtSpeaker,
+  stripNarratorLabel,
+  stripSpeakerLabel,
+  userStopSequences,
+} from "./services/contextAssembler.js";
 import {
   sendChatCompletion,
   streamChatCompletion,
@@ -25,15 +34,16 @@ import {
 import { generateFalImage, generateImage } from "./services/imageService.js";
 import { idbGet, idbRemove, idbSet } from "./storage/db.js";
 import {
-  PROJECTS_KEY,
+  PROJECT_TOKENS_KEY,
   clearAllLocalDataDurable,
   getStoredActiveProjectId,
+  hasExternalChanges,
   initDurableStorage,
-  loadProjects,
   loadProjectsDurable,
   loadRememberedApiKey,
   loadRememberedFalKey,
   loadSnippets,
+  mergeWithStored,
   saveProjectsDurable,
   saveRememberedApiKey,
   saveRememberedFalKey,
@@ -48,7 +58,7 @@ import { settingsScreen } from "./ui/renderSettings.js";
 import { storiesScreen } from "./ui/renderStories.js";
 import { worldScreen } from "./ui/renderWorld.js";
 import { closeAllSheets, openMenu, openSheet } from "./ui/sheet.js";
-import { nowIso } from "./utils/id.js";
+import { createId, nowIso } from "./utils/id.js";
 
 const elements = {
   storyButton: document.querySelector("#story-button"),
@@ -178,25 +188,14 @@ function bindEvents() {
   );
   elements.importFile.addEventListener("change", importProject);
 
+  // Other tabs announce their saves; a tab coming back from the background
+  // may have missed those announcements, so it checks on its own too.
+  syncChannel?.addEventListener("message", requestSync);
   window.addEventListener("storage", (event) => {
-    if (event.key !== PROJECTS_KEY || event.newValue === null) return;
-    if (state.busy) {
-      toast(
-        "Stories changed in another tab. Reload after this reply finishes to sync.",
-        "error",
-      );
-      return;
-    }
-    const { projects } = loadProjects();
-    if (!projects.length) return;
-    state.projects = projects;
-    if (
-      !projects.some((project) => project.project_id === state.activeProjectId)
-    ) {
-      state.activeProjectId = projects[0].project_id;
-    }
-    renderAll();
-    toast("Stories updated from another tab.");
+    if (event.key === PROJECT_TOKENS_KEY) requestSync();
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") requestSync();
   });
 
   window.addEventListener("beforeunload", (event) => {
@@ -238,10 +237,13 @@ function renderAll() {
     branch,
     pendingText: generatingHere ? state.pendingText : "",
     busy: generatingHere,
+    continuingId: generatingHere ? state.generation.continuingId : null,
     editingMessageId: state.editingMessageId,
     imageUrls: state.imageCache,
     onAction: handleMessageAction,
   });
+  // A sync that arrived mid-reply or mid-edit runs once the tab is idle.
+  if (syncDeferred && canSyncNow()) requestSync();
 }
 
 function renderComposerMode() {
@@ -314,6 +316,7 @@ function openScene() {
   openSheet(
     sceneScreen({
       project: getProject(),
+      branch: getActiveBranch(getProject()),
       onChange: () => {
         touchProject(getProject());
         persist();
@@ -379,6 +382,14 @@ function openComposerMenu() {
           ? `${state.snippets.length} saved`
           : "Save lines you type often",
         onSelect: openSnippets,
+      },
+      {
+        label: "Write my next line for me",
+        icon: "✍",
+        hint: elements.composerInput.value.trim()
+          ? "Fleshes out what you've started, for you to edit"
+          : "Drafts your next message here, for you to edit",
+        onSelect: () => void suggestMyLine(),
       },
       {
         label: "Write as the narrator",
@@ -682,7 +693,14 @@ async function handleSend(event) {
   event.preventDefault();
   if (state.busy) return;
   const raw = elements.composerInput.value.trim();
-  if (!raw) return;
+  if (!raw) {
+    // Sending nothing asks the newest reply to keep going.
+    const last = getActiveBranch(getProject()).messages.at(-1);
+    if (last?.role === "assistant" && requireApiKey("before continuing")) {
+      await requestAssistant({ continuing: last });
+    }
+    return;
+  }
   if (!state.apiKey) {
     showComposerError("Add an OpenRouter API key in Settings before sending.");
     openSettings();
@@ -722,21 +740,59 @@ function showComposerError(message) {
   elements.composerError.classList.toggle("hidden", !message);
 }
 
-async function requestAssistant() {
+const CONTINUE_INSTRUCTION =
+  "[OOC: Continue your last reply from exactly where it stops. Do not repeat or summarize anything already written, and do not start a new scene.]";
+
+/**
+ * Ask for the next reply, or with `continuing`, extend that reply in place.
+ * Replies are cut where the model starts writing the user's own turn: stop
+ * sequences end generation there, and cutAtSpeaker covers providers that
+ * ignore them.
+ */
+async function requestAssistant({ continuing = null } = {}) {
   const project = getProject();
   const branch = getActiveBranch(project);
+  const you = project.settings.you.name;
   const assembled = buildCurrentContext();
+  const messages = continuing
+    ? [...assembled.messages, { role: "user", content: CONTINUE_INSTRUCTION }]
+    : assembled.messages;
+  const clean = (text) => cutAtSpeaker(stripNarratorLabel(text), you);
   state.busy = true;
   state.pendingText = "";
   state.abortController = new AbortController();
   state.generation = {
     projectId: project.project_id,
     branchId: branch.branch_id,
+    continuingId: continuing?.message_id ?? null,
   };
   renderAll();
   let succeeded = false;
 
-  const announceReply = () => {
+  const keep = (content, metadata) => {
+    if (continuing) {
+      appendToMessage(continuing, content);
+      const { truncated, stopped, stalled, usage, ...rest } =
+        continuing.metadata;
+      continuing.metadata = {
+        ...rest,
+        ...metadata,
+        ...(usage || metadata.usage
+          ? { usage: addUsage(usage, metadata.usage) }
+          : {}),
+      };
+      branch.updated_at = nowIso();
+    } else {
+      addMessage(branch, {
+        role: "assistant",
+        speaker_name: "Narrator",
+        content,
+        metadata,
+      });
+    }
+    succeeded = true;
+    touchProject(project);
+    persist();
     if (!isGeneratingBranchVisible()) {
       toast(`Reply saved to "${branch.title}".`);
     }
@@ -744,7 +800,7 @@ async function requestAssistant() {
 
   let scheduled = false;
   const updatePending = (_token, completeText) => {
-    state.pendingText = completeText;
+    state.pendingText = clean(completeText);
     if (scheduled) return;
     scheduled = true;
     requestAnimationFrame(() => {
@@ -755,6 +811,7 @@ async function requestAssistant() {
         branch,
         pendingText: state.pendingText,
         busy: state.busy,
+        continuingId: state.generation?.continuingId ?? null,
         imageUrls: state.imageCache,
         onAction: handleMessageAction,
       });
@@ -765,45 +822,30 @@ async function requestAssistant() {
     const response = await streamChatCompletion({
       apiKey: state.apiKey,
       model: project.settings.model,
-      messages: assembled.messages,
+      messages,
       temperature: project.settings.temperature,
       maxTokens: project.settings.max_tokens,
+      stop: userStopSequences(you),
       onToken: updatePending,
       signal: state.abortController.signal,
     });
     const truncated = response.finishReason === "length";
-    addMessage(branch, {
-      role: "assistant",
-      speaker_name: "Narrator",
-      content: response.text,
-      metadata: {
-        ...(truncated ? { truncated: true } : {}),
-        ...(response.usage ? { usage: response.usage } : {}),
-      },
+    keep(clean(response.text), {
+      ...(truncated ? { truncated: true } : {}),
+      ...(response.usage ? { usage: response.usage } : {}),
     });
-    succeeded = true;
-    touchProject(project);
-    persist();
     if (truncated) {
       toast(
-        "The reply hit the length limit. Raise it in Settings if that keeps happening.",
+        "The reply hit the length limit — tap Continue to keep going, or raise the limit in Settings.",
       );
     }
-    announceReply();
   } catch (error) {
     if (error.name === "AbortError" || error.name === "StallError") {
       if (state.pendingText.trim()) {
-        addMessage(branch, {
-          role: "assistant",
-          speaker_name: "Narrator",
-          content: state.pendingText,
-          metadata:
-            error.name === "StallError" ? { stalled: true } : { stopped: true },
-        });
-        succeeded = true;
-        touchProject(project);
-        persist();
-        announceReply();
+        keep(
+          state.pendingText,
+          error.name === "StallError" ? { stalled: true } : { stopped: true },
+        );
       }
       toast(
         error.name === "AbortError"
@@ -827,6 +869,73 @@ async function requestAssistant() {
     void runPostResponseTasks();
   }
   return succeeded;
+}
+
+function addUsage(left = {}, right = {}) {
+  const sum = {};
+  for (const key of ["prompt_tokens", "completion_tokens", "cost"]) {
+    const total = (Number(left?.[key]) || 0) + (Number(right?.[key]) || 0);
+    if (Number.isFinite(left?.[key]) || Number.isFinite(right?.[key])) {
+      sum[key] = total;
+    }
+  }
+  return sum;
+}
+
+/**
+ * "Write my next line for me": draft the user's own next message into the
+ * composer, building on whatever they have started, for them to edit and
+ * send. It never enters the transcript on its own.
+ */
+async function suggestMyLine() {
+  if (state.busy) return;
+  if (!requireApiKey("before drafting a line")) return;
+  const project = getProject();
+  const you = project.settings.you.name.trim();
+  const who = you || "the user's character";
+  const draft = elements.composerInput.value.trim();
+  const instruction = `[OOC: Pause the story. Just this once, draft the next message for ${who} on the user's behalf: what ${who} says and does next, in the same voice, tense and person as ${who}'s earlier messages. Write only ${who}'s part — nobody else speaks or acts — in one short paragraph.${
+    draft ? ` Build on this start, keeping its intent: ${draft}` : ""
+  } Reply with the message text only, with no name label.]`;
+  const clean = (text) =>
+    stripNarratorLabel(stripSpeakerLabel(text, you)).trimStart();
+
+  state.compose = { ...DEFAULT_COMPOSE };
+  state.busy = true;
+  state.abortController = new AbortController();
+  elements.composerInput.readOnly = true;
+  showComposerError("");
+  renderAll();
+  try {
+    const response = await streamChatCompletion({
+      apiKey: state.apiKey,
+      model: project.settings.model,
+      messages: [
+        ...buildCurrentContext().messages,
+        { role: "user", content: instruction },
+      ],
+      temperature: project.settings.temperature,
+      maxTokens: Math.min(project.settings.max_tokens, 500),
+      onToken: (_token, completeText) => {
+        elements.composerInput.value = clean(completeText);
+        autoGrowComposer();
+      },
+      signal: state.abortController.signal,
+    });
+    elements.composerInput.value = clean(response.text).trimEnd();
+  } catch (error) {
+    if (error.name !== "AbortError" && error.name !== "StallError") {
+      elements.composerInput.value = draft;
+      toast(`Could not draft a line: ${error.message}`, "error");
+    }
+  } finally {
+    elements.composerInput.readOnly = false;
+    state.busy = false;
+    state.abortController = null;
+    renderAll();
+    autoGrowComposer();
+    elements.composerInput.focus();
+  }
 }
 
 /* ------------------------------------------------------- message actions */
@@ -875,6 +984,24 @@ async function handleMessageAction(action, messageId, payload) {
     return;
   }
 
+  if (action === "continue") {
+    if (branch.messages.at(-1) !== message || message.role !== "assistant") {
+      return;
+    }
+    if (!requireApiKey("before continuing")) return;
+    showComposerError("");
+    await requestAssistant({ continuing: message });
+    return;
+  }
+
+  if (action === "reply") {
+    if (branch.messages.at(-1) !== message) return;
+    if (!requireApiKey("before asking for a reply")) return;
+    showComposerError("");
+    await requestAssistant();
+    return;
+  }
+
   if (action === "edit-save") {
     if (typeof payload !== "string" || !payload.trim()) return;
     editMessage(branch, messageId, { content: payload });
@@ -889,12 +1016,7 @@ async function handleMessageAction(action, messageId, payload) {
     });
     if (!confirmed) return;
     deleteMessage(branch, messageId);
-    if (message.metadata?.has_image) {
-      state.imageCache.delete(messageId);
-      idbRemove(`image:${messageId}`).catch(() => {
-        // Orphaned pixels are harmless; the record is already gone.
-      });
-    }
+    releaseImage(message);
   }
 
   if (action === "swipe") {
@@ -910,9 +1032,7 @@ async function handleMessageAction(action, messageId, payload) {
 
 function openMessageMenu(project, branch, message) {
   const isLastAssistant =
-    message.role === "assistant" &&
-    [...branch.messages].reverse().find((item) => item.role === "assistant")
-      ?.message_id === message.message_id;
+    message.role === "assistant" && branch.messages.at(-1) === message;
 
   const items = [
     {
@@ -968,7 +1088,9 @@ async function regenerateMessage(project, branch, messageId) {
   const index = branch.messages.findIndex(
     (item) => item.message_id === messageId,
   );
-  if (index < 0) return;
+  // The new take is generated at the end of the branch, so only the newest
+  // message can be rewritten without shuffling the transcript.
+  if (index < 0 || index !== branch.messages.length - 1) return;
   const [removed] = branch.messages.splice(index, 1);
   branch.updated_at = nowIso();
   touchProject(project);
@@ -1015,6 +1137,7 @@ async function runPostResponseTasks() {
     // Best-effort automation; the user can always summarize manually.
   } finally {
     postTasksRunning = false;
+    if (syncDeferred) requestSync();
   }
 }
 
@@ -1162,7 +1285,7 @@ async function rememberMessage(project, branch, message) {
 // Illustrate: turn the scene around a message into a picture. Stage one asks
 // the text model to write a visual prompt from the story context; the user can
 // edit it before stage two sends it to the image model. Pixels live in
-// IndexedDB under image:<message_id>; the project JSON only keeps the prompt.
+// IndexedDB under image:<image_id>; the project JSON only keeps the prompt.
 async function illustrateMessage(project, branch, message) {
   if (!requireApiKey("before generating images")) return;
   state.busy = true;
@@ -1250,20 +1373,24 @@ async function illustrateMessage(project, branch, message) {
           model: project.settings.image_model,
           prompt,
         });
-    state.imageCache.set(message.message_id, image.dataUrl);
+    const imageId = createId("img");
+    state.imageCache.set(imageId, image.dataUrl);
     try {
-      await idbSet(`image:${message.message_id}`, image.dataUrl);
+      await idbSet(`image:${imageId}`, image.dataUrl);
     } catch {
       toast(
         "The image could not be stored — it will disappear when you close this tab.",
         "error",
       );
     }
+    const previous = { ...message, metadata: { ...message.metadata } };
     message.metadata = {
       ...message.metadata,
       has_image: true,
+      image_id: imageId,
       image_prompt: prompt,
     };
+    releaseImage(previous);
     branch.updated_at = nowIso();
     touchProject(project);
     persist();
@@ -1453,7 +1580,7 @@ async function clearData() {
     danger: true,
   });
   if (!confirmed) return;
-  await clearAllLocalDataDurable();
+  await queueStorage(() => clearAllLocalDataDurable());
   const project = createStoryProject({ title: "Untitled story" });
   state.projects = [project];
   state.activeProjectId = project.project_id;
@@ -1487,7 +1614,7 @@ function buildCurrentContext() {
 // each one arrives so renderChat can stay synchronous.
 function loadBranchImages(branch) {
   for (const message of branch.messages) {
-    const id = message.message_id;
+    const id = imageKeyFor(message);
     if (
       !message.metadata?.has_image ||
       state.imageCache.has(id) ||
@@ -1514,6 +1641,18 @@ function loadBranchImages(branch) {
         state.imageLoadsPending.delete(id);
       });
   }
+}
+
+// Forked branches share message copies, and so can share an image; only
+// drop the pixels once no message anywhere still shows them.
+function releaseImage(message) {
+  if (!message.metadata?.has_image) return;
+  const key = imageKeyFor(message);
+  if (isImageReferenced(state.projects, key)) return;
+  state.imageCache.delete(key);
+  idbRemove(`image:${key}`).catch(() => {
+    // Orphaned pixels are harmless; the record is already gone.
+  });
 }
 
 function isGeneratingBranchVisible() {
@@ -1570,24 +1709,111 @@ function parseJsonObject(text) {
 
 let lastSaveErrorToastAt = 0;
 
+// Saves, merges and erases run one at a time, in order, so a merge never
+// interleaves with a save of the projects it is replacing.
+let storageChain = Promise.resolve();
+
+function queueStorage(task) {
+  const run = storageChain.then(task);
+  storageChain = run.catch(() => {});
+  return run;
+}
+
+let saveQueued = false;
+
 function persist() {
   setStoredActiveProjectId(state.activeProjectId);
-  void saveProjectsDurable(state.projects).then((result) => {
-    state.saveFailed = !result.ok;
-    if (!result.ok && storageAvailable) {
-      const now = Date.now();
-      if (now - lastSaveErrorToastAt > 10000) {
-        lastSaveErrorToastAt = now;
-        toast(
-          result.quotaExceeded
+  // A save still waiting its turn serializes state when it runs, so it
+  // already covers whatever changed since it was queued.
+  if (saveQueued) return;
+  saveQueued = true;
+  void queueStorage(async () => {
+    saveQueued = false;
+    await saveAndReport();
+  });
+}
+
+async function saveAndReport() {
+  let result = await saveProjectsDurable(state.projects);
+  // Another tab saved since this one last synced: fold its work in, then
+  // write the merged set instead of overwriting it.
+  for (let attempt = 0; result.conflict && attempt < 3; attempt += 1) {
+    await adoptStoredChanges();
+    result = await saveProjectsDurable(state.projects);
+  }
+  if (result.ok) syncChannel?.postMessage("saved");
+  state.saveFailed = !result.ok;
+  if (!result.ok && storageAvailable) {
+    const now = Date.now();
+    if (now - lastSaveErrorToastAt > 10000) {
+      lastSaveErrorToastAt = now;
+      toast(
+        result.conflict
+          ? "Save failed: another tab keeps changing these stories. Close the other tab, then try again."
+          : result.quotaExceeded
             ? "Save failed: browser storage is full. Export your story to avoid losing work."
             : "Save failed: could not write to browser storage.",
-          "error",
-        );
-      }
+        "error",
+      );
     }
-    renderSaveStatus();
+  }
+  renderSaveStatus();
+}
+
+/* ------------------------------------------------------- other tabs */
+
+const syncChannel =
+  typeof BroadcastChannel === "function"
+    ? new BroadcastChannel("story-loom")
+    : null;
+let syncDeferred = false;
+
+// Swapping in another tab's copy of a project mid-reply or mid-edit would
+// strand the work in progress on an object that is no longer shown, so
+// syncing waits until the tab is idle. A save in the meantime still merges.
+function canSyncNow() {
+  return !state.busy && !postTasksRunning && !state.editingMessageId;
+}
+
+function requestSync() {
+  if (!state) return;
+  if (!canSyncNow()) {
+    syncDeferred = true;
+    return;
+  }
+  syncDeferred = false;
+  void queueStorage(async () => {
+    if (!canSyncNow()) {
+      syncDeferred = true;
+      return;
+    }
+    if (!(await hasExternalChanges())) return;
+    const merge = await adoptStoredChanges();
+    if (merge.localChanges) persist();
   });
+}
+
+async function adoptStoredChanges() {
+  const merge = await mergeWithStored(state.projects);
+  state.projects = merge.projects;
+  if (
+    !state.projects.some(
+      (project) => project.project_id === state.activeProjectId,
+    )
+  ) {
+    state.compose = { ...DEFAULT_COMPOSE };
+    // getProject() falls back to (or creates) a story when this one is gone.
+    state.activeProjectId = state.projects[0]?.project_id ?? null;
+  }
+  if (merge.adopted) {
+    renderAll();
+    toast(
+      merge.conflicts.length
+        ? `"${merge.conflicts[0]}" was changed in another tab too — both versions were kept.`
+        : "Stories updated from another tab.",
+    );
+  }
+  return merge;
 }
 
 function toast(message, type = "") {

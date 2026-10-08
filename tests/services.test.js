@@ -9,13 +9,22 @@ import {
 } from "../src/models/storyProject.js";
 import {
   addMessageVersion,
+  appendToMessage,
   compareBranches,
   editMessage,
   forkBranch,
   getActiveVersionIndex,
+  imageKeyFor,
+  isImageReferenced,
   setActiveMessageVersion,
 } from "../src/services/branchService.js";
-import { assembleContext } from "../src/services/contextAssembler.js";
+import {
+  assembleContext,
+  cutAtSpeaker,
+  stripNarratorLabel,
+  stripSpeakerLabel,
+  userStopSequences,
+} from "../src/services/contextAssembler.js";
 
 test("normalizeProject repairs missing collections and active branch", () => {
   const project = normalizeProject({
@@ -237,6 +246,39 @@ test("context assembly maps narrative roles to OpenRouter roles", () => {
   });
 });
 
+test("assistant turns reach the model without a speaker label", () => {
+  const project = createStoryProject();
+  project.branches[0].messages = [
+    createMessage({
+      role: "assistant",
+      speaker_name: "Narrator",
+      content: "Narrator: Narrator: The lamps gutter.",
+    }),
+  ];
+
+  const result = assembleContext({
+    storyProject: project,
+    activeBranchId: project.active_branch_id,
+  });
+
+  assert.deepEqual(result.messages.at(-1), {
+    role: "assistant",
+    content: "The lamps gutter.",
+  });
+});
+
+test("stripNarratorLabel removes stacked leading labels only", () => {
+  assert.equal(stripNarratorLabel("Narrator: Narrator: Rain."), "Rain.");
+  assert.equal(stripNarratorLabel("**Narrator:** Rain."), "Rain.");
+  assert.equal(stripNarratorLabel("assistant: Rain."), "Rain.");
+  assert.equal(stripNarratorLabel("Mara: Rain."), "Mara: Rain.");
+  assert.equal(
+    stripNarratorLabel("The narrator: an unreliable one."),
+    "The narrator: an unreliable one.",
+  );
+  assert.equal(stripNarratorLabel("Narrator:"), "Narrator:");
+});
+
 test("context assembly keeps a truncated newest message when it exceeds the budget", () => {
   const project = createStoryProject();
   project.branches[0].messages = [
@@ -450,4 +492,161 @@ test("legacy personas migrate into settings.you and the cast", () => {
     project.characters.map((character) => character.name),
     ["Understudy"],
   );
+});
+
+function branchWithSummary(messageCount, summarizedCount) {
+  const project = createStoryProject();
+  const branch = project.branches[0];
+  branch.messages = Array.from({ length: messageCount }, (_, index) =>
+    createMessage({ content: `line ${index}` }),
+  );
+  branch.summary = "Everything up to the duel.";
+  branch.summary_message_count = summarizedCount;
+  return { project, branch };
+}
+
+test("forking before the summarized point leaves the future out of memory", () => {
+  const { project, branch } = branchWithSummary(40, 20);
+
+  const fork = forkBranch(
+    project,
+    branch.branch_id,
+    branch.messages[9].message_id,
+    "Earlier",
+  );
+
+  assert.equal(fork.summary, "");
+  assert.equal(fork.summary_message_count, 0);
+});
+
+test("forking after the summarized point keeps the summary and its coverage", () => {
+  const { project, branch } = branchWithSummary(40, 20);
+
+  const fork = forkBranch(
+    project,
+    branch.branch_id,
+    branch.messages[29].message_id,
+    "Later",
+  );
+
+  assert.equal(fork.summary, "Everything up to the duel.");
+  assert.equal(fork.summary_message_count, 20);
+});
+
+test("a forked copy keeps an image alive after the original is deleted", () => {
+  const project = createStoryProject();
+  const branch = project.branches[0];
+  branch.messages = [
+    createMessage({
+      role: "assistant",
+      content: "The bridge burns.",
+      metadata: { has_image: true, image_id: "img_1" },
+    }),
+  ];
+  forkBranch(project, branch.branch_id, branch.messages[0].message_id, "Fork");
+  const key = imageKeyFor(branch.messages[0]);
+  branch.messages = [];
+
+  assert.equal(key, "img_1");
+  assert.equal(isImageReferenced([project], key), true);
+  project.branches[1].messages = [];
+  assert.equal(isImageReferenced([project], key), false);
+});
+
+test("images stored before image ids existed still resolve by message id", () => {
+  const message = createMessage({ metadata: { has_image: true } });
+  assert.equal(imageKeyFor(message), message.message_id);
+});
+
+test("the author's note sits just before the newest message", () => {
+  const project = createStoryProject();
+  const branch = project.branches[0];
+  branch.author_note = "Keep it tense.";
+  branch.messages = [
+    createMessage({ role: "assistant", content: "The door creaks." }),
+    createMessage({ role: "user", content: "I freeze." }),
+  ];
+
+  const { messages } = assembleContext({
+    storyProject: project,
+    activeBranchId: branch.branch_id,
+  });
+
+  assert.deepEqual(
+    messages.slice(-3).map((message) => message.content),
+    ["The door creaks.", "[Author's note: Keep it tense.]", "I freeze."],
+  );
+  assert.ok(!messages[0].content.includes("Keep it tense."));
+});
+
+test("example dialogue reaches the character sheet in context", () => {
+  const project = createStoryProject({
+    characters: [
+      {
+        name: "Mara",
+        example_dialogue: '"You\'re late."\n*She taps the map.*',
+      },
+    ],
+  });
+
+  const { messages } = assembleContext({
+    storyProject: project,
+    activeBranchId: project.active_branch_id,
+  });
+
+  assert.match(
+    messages[0].content,
+    /Example dialogue:\n {4}"You're late\."\n {4}\*She taps the map\.\*/,
+  );
+});
+
+test("replies are cut where the model starts writing the user's turn", () => {
+  assert.deepEqual(userStopSequences("Corwin"), [
+    "\nCorwin:",
+    "\n**Corwin:**",
+    "\n**Corwin**:",
+  ]);
+  assert.deepEqual(userStopSequences(""), []);
+  assert.equal(
+    cutAtSpeaker("Mara turns.\n\nCorwin: I nod.", "Corwin"),
+    "Mara turns.",
+  );
+  assert.equal(
+    cutAtSpeaker("Mara turns.\n**Corwin:** I nod.", "Corwin"),
+    "Mara turns.",
+  );
+  assert.equal(
+    cutAtSpeaker("Corwin: is what she calls you.", "Corwin"),
+    "Corwin: is what she calls you.",
+  );
+  assert.equal(cutAtSpeaker("Mara turns.", ""), "Mara turns.");
+});
+
+test("stripSpeakerLabel drops the user's own name label from a draft", () => {
+  assert.equal(stripSpeakerLabel("Corwin: I wait.", "Corwin"), "I wait.");
+  assert.equal(stripSpeakerLabel("**Corwin:** I wait.", "corwin"), "I wait.");
+  assert.equal(stripSpeakerLabel("I wait.", "Corwin"), "I wait.");
+});
+
+test("appendToMessage joins mid-sentence on the line, finished ones as a paragraph", () => {
+  const cut = createMessage({ role: "assistant", content: "She reached for the" });
+  appendToMessage(cut, " lantern.");
+  assert.equal(cut.content, "She reached for the lantern.");
+
+  const done = createMessage({ role: "assistant", content: "She left." });
+  addMessageVersion(done, "She stayed.");
+  appendToMessage(done, "Night fell.");
+  assert.equal(done.content, "She stayed.\n\nNight fell.");
+  assert.deepEqual(done.metadata.versions, ["She left.", "She stayed.\n\nNight fell."]);
+});
+
+test("forks inherit the branch's author's note", () => {
+  const project = createStoryProject();
+  const branch = project.branches[0];
+  branch.author_note = "Slow burn.";
+  branch.messages = [createMessage({ content: "one" })];
+
+  const fork = forkBranch(project, branch.branch_id, branch.messages[0].message_id, "F");
+
+  assert.equal(fork.author_note, "Slow burn.");
 });

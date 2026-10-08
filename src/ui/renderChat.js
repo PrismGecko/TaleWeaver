@@ -1,6 +1,7 @@
 import {
   getActiveVersionIndex,
   getMessageVersions,
+  imageKeyFor,
 } from "../services/branchService.js";
 import { renderRichText } from "../utils/richText.js";
 import { setText } from "../utils/sanitize.js";
@@ -16,6 +17,7 @@ export function renderChat({
   branch,
   pendingText = "",
   busy = false,
+  continuingId = null,
   editingMessageId = null,
   imageUrls = new Map(),
   onAction,
@@ -37,9 +39,12 @@ export function renderChat({
     return;
   }
 
-  const lastAssistantId = [...branch.messages]
-    .reverse()
-    .find((message) => message.role === "assistant")?.message_id;
+  // Retry rewrites the newest message in place, so it is only offered when
+  // the newest message is a reply. When it is not — the reply failed, was
+  // stopped before any text arrived, or was deleted — the newest message
+  // offers to fetch one instead.
+  const lastMessage = branch.messages.at(-1);
+  const lastIsReply = lastMessage?.role === "assistant";
 
   for (const message of branch.messages) {
     const article = document.createElement("article");
@@ -89,35 +94,37 @@ export function renderChat({
       article.append(content);
     }
 
+    // Continue streams into the reply it extends rather than a new bubble.
+    if (busy && message.message_id === continuingId) {
+      article.append(pendingContent(pendingText));
+    }
+
     if (message.metadata?.has_image) {
-      article.append(imageFigure(message, imageUrls.get(message.message_id)));
+      article.append(imageFigure(message, imageUrls.get(imageKeyFor(message))));
     }
 
     if (
-      message.message_id === lastAssistantId &&
+      message === lastMessage &&
       message.message_id !== editingMessageId &&
       !busy
     ) {
-      article.append(replyFooter(message, onAction));
+      article.append(
+        lastIsReply
+          ? replyFooter(message, onAction)
+          : awaitingReplyFooter(message, onAction),
+      );
     }
 
     container.append(article);
   }
 
-  if (busy || pendingText) {
+  if ((busy || pendingText) && !continuingId) {
     const pending = document.createElement("article");
     pending.className = "message message-assistant message-pending";
     const label = document.createElement("span");
     label.className = "message-role";
     label.textContent = "Narrator";
-    const content = document.createElement("div");
-    content.className = "message-content";
-    if (pendingText) {
-      renderRichText(content, pendingText);
-    } else {
-      content.append(thinkingDots());
-    }
-    pending.append(label, content);
+    pending.append(label, pendingContent(pendingText));
     container.append(pending);
   }
 
@@ -160,6 +167,12 @@ function replyFooter(message, onAction) {
     footer.append(previous, counter, next);
   }
 
+  const more = footerButton("→ Continue", "Keep this reply going");
+  more.classList.add("has-label");
+  more.addEventListener("click", () =>
+    onAction("continue", message.message_id),
+  );
+
   const retry = footerButton("↻ Retry", "Write this reply again");
   retry.classList.add("has-label");
   retry.addEventListener("click", () =>
@@ -172,7 +185,29 @@ function replyFooter(message, onAction) {
     onAction("illustrate", message.message_id),
   );
 
-  footer.append(retry, illustrate);
+  footer.append(more, retry, illustrate);
+  return footer;
+}
+
+function pendingContent(pendingText) {
+  const content = document.createElement("div");
+  content.className = "message-content";
+  if (pendingText) {
+    renderRichText(content, pendingText);
+  } else {
+    content.append(thinkingDots());
+  }
+  return content;
+}
+
+/** Under a newest message that never got its reply. */
+function awaitingReplyFooter(message, onAction) {
+  const footer = document.createElement("div");
+  footer.className = "reply-footer";
+  const reply = footerButton("↻ Get a reply", "Ask the AI to answer this");
+  reply.classList.add("has-label");
+  reply.addEventListener("click", () => onAction("reply", message.message_id));
+  footer.append(reply);
   return footer;
 }
 

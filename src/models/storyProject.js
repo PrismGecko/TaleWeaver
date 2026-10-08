@@ -57,6 +57,9 @@ export function createBranch(overrides = {}) {
       ? overrides.messages.map(createMessage)
       : [],
     summary: toPlainText(overrides.summary),
+    // Scene-level steering placed just before the newest message, where it
+    // outweighs the long system prompt; see contextAssembler.
+    author_note: toPlainText(overrides.author_note),
     summary_message_count: safeNumber(overrides.summary_message_count, 0, {
       min: 0,
     }),
@@ -352,6 +355,7 @@ function normalizeCharacter(input = {}) {
     description: toPlainText(input.description),
     personality: toPlainText(input.personality),
     speech_style: toPlainText(input.speech_style),
+    example_dialogue: toPlainText(input.example_dialogue),
     goals: toPlainText(input.goals),
     secrets: toPlainText(input.secrets),
     relationships: toPlainText(input.relationships),

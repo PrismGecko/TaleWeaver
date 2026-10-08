@@ -231,3 +231,21 @@ test("extractFalImageUrl reads fal.ai image results", async () => {
   assert.equal(extractFalImageUrl({ images: [] }), null);
   assert.equal(extractFalImageUrl({ detail: "error" }), null);
 });
+
+test("stop sequences are sent only when there are some", async () => {
+  const bodies = [];
+  const mock = async (_url, init) => {
+    bodies.push(JSON.parse(init.body));
+    return streamResponse([
+      sseChunk({ choices: [{ delta: { content: "Hi" } }] }),
+      "data: [DONE]\n\n",
+    ]);
+  };
+  await withFetch(mock, async () => {
+    await streamChatCompletion({ ...baseRequest, stop: ["\nCorwin:"] });
+    await streamChatCompletion(baseRequest);
+  });
+
+  assert.deepEqual(bodies[0].stop, ["\nCorwin:"]);
+  assert.equal("stop" in bodies[1], false);
+});

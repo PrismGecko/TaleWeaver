@@ -58,11 +58,19 @@ export function forkBranch(project, sourceBranchId, sourceMessageId, title) {
     throw new Error("Fork source message not found.");
   }
 
+  // The summary describes the first summary_message_count messages. Forking
+  // before that point would hand the new branch a memory of events it never
+  // reached, so it starts without one and auto-summarize rebuilds it.
+  const keptCount = messageIndex + 1;
+  const summaryFits = (source.summary_message_count || 0) <= keptCount;
+
   const fork = createBranch({
     parent_branch_id: source.branch_id,
     title: title || `Fork of ${source.title}`,
-    messages: source.messages.slice(0, messageIndex + 1),
-    summary: source.summary,
+    messages: source.messages.slice(0, keptCount),
+    summary: summaryFits ? source.summary : "",
+    author_note: source.author_note,
+    summary_message_count: summaryFits ? source.summary_message_count : 0,
     tags: source.tags,
     fork_source_message_id: sourceMessageId,
   });
@@ -70,6 +78,25 @@ export function forkBranch(project, sourceBranchId, sourceMessageId, title) {
   project.active_branch_id = fork.branch_id;
   project.updated_at = nowIso();
   return fork;
+}
+
+// Illustrations live in IndexedDB under image:<key>. Forked branches copy
+// messages with their ids, so keying pixels by message id let one branch's
+// delete or re-illustrate clobber another's; new images get their own id.
+// Older images were stored under the message id and still resolve.
+export function imageKeyFor(message) {
+  return message.metadata?.image_id || message.message_id;
+}
+
+export function isImageReferenced(projects, key) {
+  return projects.some((project) =>
+    project.branches.some((branch) =>
+      branch.messages.some(
+        (message) =>
+          message.metadata?.has_image && imageKeyFor(message) === key,
+      ),
+    ),
+  );
 }
 
 // Regeneration "swipes": every take of a message is kept in
@@ -98,6 +125,26 @@ export function addMessageVersion(message, content) {
     version_index: versions.length - 1,
   };
   message.content = content;
+  return message;
+}
+
+/** Extend a message in place (Continue), keeping its active take in step. */
+export function appendToMessage(message, text) {
+  const before = message.content.trimEnd();
+  const addition = text.trimStart();
+  // A reply cut off mid-sentence picks up on the same line; one that ended
+  // cleanly carries on in a new paragraph.
+  const joiner = !before
+    ? ""
+    : /[.!?…"”*)\]~—-]$/.test(before)
+      ? "\n\n"
+      : " ";
+  message.content = `${before}${joiner}${addition}`;
+  if (Array.isArray(message.metadata?.versions)) {
+    const versions = getMessageVersions(message);
+    versions[getActiveVersionIndex(message)] = message.content;
+    message.metadata = { ...message.metadata, versions };
+  }
   return message;
 }
 

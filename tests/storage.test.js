@@ -1,13 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { createStoryProject } from "../src/models/storyProject.js";
+import { createMessage, createStoryProject } from "../src/models/storyProject.js";
 import {
   PROJECTS_KEY,
+  PROJECT_TOKENS_KEY,
   isStorageAvailable,
   loadProjects,
+  loadProjectsDurable,
   loadSnippets,
+  mergeProjectSets,
+  mergeWithStored,
   saveProjects,
+  saveProjectsDurable,
   saveSnippets,
 } from "../src/storage/projectStorage.js";
 
@@ -134,4 +139,97 @@ test("snippets round-trip and filter out junk entries", () => {
 
   storage.setItem("story-loom.snippets.v1", "not json");
   assert.deepEqual(loadSnippets(storage), []);
+});
+
+// Stands in for a second tab: it writes the project list plus a fresh token
+// for each project, the way that tab's own save would.
+function saveFromOtherTab(storage, projects) {
+  storage.setItem(PROJECTS_KEY, JSON.stringify(projects));
+  storage.setItem(
+    PROJECT_TOKENS_KEY,
+    JSON.stringify(
+      Object.fromEntries(
+        projects.map((project) => [project.project_id, `other-${Math.random()}`]),
+      ),
+    ),
+  );
+}
+
+function withLine(project, text) {
+  const copy = JSON.parse(JSON.stringify(project));
+  copy.branches[0].messages.push(createMessage({ content: text }));
+  return copy;
+}
+
+test("a stale tab cannot overwrite another tab's newer save", async () => {
+  const storage = memoryStorage();
+  const story = createStoryProject({ title: "Shared" });
+  await loadProjectsDurable(storage);
+  assert.equal((await saveProjectsDurable([story], storage)).ok, true);
+
+  saveFromOtherTab(storage, [withLine(story, "written in the other tab")]);
+  const fresh = createStoryProject({ title: "New here" });
+  const result = await saveProjectsDurable([story, fresh], storage);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.conflict, true);
+  const stored = JSON.parse(storage.getItem(PROJECTS_KEY));
+  assert.equal(stored[0].branches[0].messages.length, 1);
+});
+
+test("merging adopts the other tab's edits and keeps this tab's new work", async () => {
+  const storage = memoryStorage();
+  const story = createStoryProject({ title: "Shared" });
+  await loadProjectsDurable(storage);
+  await saveProjectsDurable([story], storage);
+
+  saveFromOtherTab(storage, [withLine(story, "written in the other tab")]);
+  const fresh = createStoryProject({ title: "New here" });
+  const merge = await mergeWithStored([story, fresh], storage);
+
+  assert.deepEqual(
+    merge.projects.map((project) => project.title),
+    ["Shared", "New here"],
+  );
+  assert.equal(merge.projects[0].branches[0].messages.length, 1);
+  assert.equal(merge.adopted, true);
+  assert.equal(merge.localChanges, true);
+  assert.equal((await saveProjectsDurable(merge.projects, storage)).ok, true);
+  assert.equal(JSON.parse(storage.getItem(PROJECTS_KEY)).length, 2);
+});
+
+test("a story both tabs changed is kept twice rather than lost", async () => {
+  const storage = memoryStorage();
+  const story = createStoryProject({ title: "Shared" });
+  await loadProjectsDurable(storage);
+  await saveProjectsDurable([story], storage);
+
+  saveFromOtherTab(storage, [withLine(story, "theirs")]);
+  const ours = withLine(story, "ours");
+  const merge = await mergeWithStored([ours], storage);
+
+  assert.deepEqual(merge.conflicts, ["Shared"]);
+  assert.equal(merge.projects.length, 2);
+  assert.equal(merge.projects[0], ours);
+  assert.equal(merge.projects[1].title, "Shared (from another tab)");
+  assert.notEqual(merge.projects[1].project_id, story.project_id);
+  assert.equal(merge.projects[1].branches[0].messages[0].content, "theirs");
+});
+
+test("deletions only win over copies nobody touched", () => {
+  const kept = createStoryProject({ title: "Kept" });
+  const deletedThere = createStoryProject({ title: "Deleted there" });
+  const deletedHere = createStoryProject({ title: "Deleted here" });
+  const synced = new Set([kept, deletedThere, deletedHere].map((p) => p.project_id));
+
+  const merge = mergeProjectSets({
+    ours: [kept, deletedThere],
+    theirs: [kept, deletedHere],
+    wasSynced: (id) => synced.has(id),
+    oursChanged: () => false,
+    theirsChanged: () => false,
+  });
+
+  assert.deepEqual(merge.projects, [kept]);
+  assert.equal(merge.localChanges, true);
 });

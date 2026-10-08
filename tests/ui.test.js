@@ -35,6 +35,15 @@ globalThis.Blob = dom.window.Blob;
 globalThis.requestAnimationFrame = (callback) => setTimeout(callback, 0);
 globalThis.URL.createObjectURL ??= () => "blob:stub";
 globalThis.URL.revokeObjectURL ??= () => {};
+// The app opens a BroadcastChannel to hear other tabs; in Node an open
+// channel keeps the test process alive, so let it go once tests finish.
+const NodeBroadcastChannel = globalThis.BroadcastChannel;
+globalThis.BroadcastChannel = class extends NodeBroadcastChannel {
+  constructor(name) {
+    super(name);
+    this.unref?.();
+  }
+};
 
 // jsdom implements <dialog> markup but not its modal methods, so stand them up
 // with just enough behaviour for the sheet layer: an `open` attribute and a
@@ -285,6 +294,7 @@ test("the composer's plus menu covers every old dropdown", async () => {
   const labels = textsOf(".menu-label", topSheet());
   assert.deepEqual(labels, [
     "Quick responses",
+    "Write my next line for me",
     "Write as the narrator",
     "Speak as a character",
     "Aside to the AI",
@@ -370,4 +380,165 @@ test("the scene picker sets location and cast with taps", async () => {
   click(sheet().querySelector(".sheet-close"));
   await settled();
   assert.equal(document.querySelectorAll("dialog.sheet[open]").length, 0);
+});
+
+test("retry is only offered when a reply is the newest message", async () => {
+  const { renderChat } = await import("../src/ui/renderChat.js");
+  const { createBranch, createMessage } = await import(
+    "../src/models/storyProject.js"
+  );
+  const branch = createBranch({
+    messages: [
+      createMessage({ role: "assistant", content: "The gate opens." }),
+      createMessage({ role: "user", content: "I step through." }),
+    ],
+  });
+  const actions = [];
+  const container = document.createElement("div");
+  renderChat({
+    container,
+    branch,
+    onAction: (...args) => actions.push(args),
+  });
+
+  const [reply, mine] = container.querySelectorAll(".message");
+  assert.equal(reply.querySelector(".reply-footer"), null);
+  assert.deepEqual(textsOf(".reply-action", mine), ["↻ Get a reply"]);
+
+  click(mine.querySelector(".reply-action"));
+  assert.deepEqual(actions, [["reply", branch.messages[1].message_id]]);
+});
+
+test("the newest reply offers Continue, and a continuation streams into it", async () => {
+  const { renderChat } = await import("../src/ui/renderChat.js");
+  const { createBranch, createMessage } = await import(
+    "../src/models/storyProject.js"
+  );
+  const branch = createBranch({
+    messages: [createMessage({ role: "assistant", content: "The gate" })],
+  });
+  const container = document.createElement("div");
+  renderChat({ container, branch, onAction: () => {} });
+  assert.deepEqual(textsOf(".reply-action", container), [
+    "→ Continue",
+    "↻ Retry",
+    "✦ Illustrate",
+  ]);
+
+  renderChat({
+    container,
+    branch,
+    busy: true,
+    pendingText: "swings open.",
+    continuingId: branch.messages[0].message_id,
+    onAction: () => {},
+  });
+  const messages = container.querySelectorAll(".message");
+  assert.equal(messages.length, 1, "no separate pending bubble");
+  assert.match(messages[0].textContent, /The gate.*swings open\./s);
+});
+
+test("the scene sheet carries this branch's author's note", async () => {
+  click($("#scene-chip"));
+  await settled();
+  const note = sheetBody().querySelector("textarea[name=author_note]");
+  assert.ok(note, "author's note field is on the scene sheet");
+  note.value = "Keep it tense.";
+  note.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+  click(sheet().querySelector(".sheet-close"));
+  await new Promise((resolve) => setTimeout(resolve, 450));
+
+  click($("#scene-chip"));
+  await settled();
+  assert.equal(
+    sheetBody().querySelector("textarea[name=author_note]").value,
+    "Keep it tense.",
+  );
+  click(sheet().querySelector(".sheet-close"));
+  await settled();
+});
+
+// From here on the app talks to a fake OpenRouter: streamed requests get an
+// SSE reply, background chores (emotion tracking) get an empty JSON object.
+const requests = [];
+let nextReply = "";
+function fakeOpenRouter() {
+  globalThis.fetch = async (_url, init) => {
+    const body = JSON.parse(init.body);
+    requests.push(body);
+    if (!body.stream) {
+      return new Response(
+        JSON.stringify({ choices: [{ message: { content: "{}" } }] }),
+        { status: 200 },
+      );
+    }
+    const encoder = new TextEncoder();
+    const chunk = `data: ${JSON.stringify({
+      choices: [{ delta: { content: nextReply }, finish_reason: "stop" }],
+    })}\n\ndata: [DONE]\n\n`;
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode(chunk));
+          controller.close();
+        },
+      }),
+      { status: 200 },
+    );
+  };
+}
+
+test("Continue extends the newest reply in place", async () => {
+  click($("#settings-button"));
+  await settled();
+  sheetBody().querySelector('input[name="api_key"]').value = "sk-test";
+  click(sheet().querySelector(".sheet-action"));
+  await settled();
+  document.querySelectorAll("dialog.sheet[open]").forEach((d) => d.close());
+  fakeOpenRouter();
+
+  nextReply = "She folds it away.\nCorwin Ash: I take it from her.";
+  const continueButton = [...document.querySelectorAll(".reply-action")].find(
+    (button) => button.textContent === "→ Continue",
+  );
+  click(continueButton);
+  await settled();
+  await settled();
+
+  const messages = document.querySelectorAll("#transcript .message");
+  assert.equal(messages.length, 1);
+  assert.match(messages[0].textContent, /tomorrow's date\.\s*She folds it away\./);
+  assert.doesNotMatch(messages[0].textContent, /I take it from her/);
+
+  const sent = requests.find((body) => body.stream);
+  assert.deepEqual(sent.stop, [
+    "\nCorwin Ash:",
+    "\n**Corwin Ash:**",
+    "\n**Corwin Ash**:",
+  ]);
+  const contents = sent.messages.map((message) => message.content);
+  assert.match(contents.at(-1), /Continue your last reply/);
+  assert.ok(contents.includes("[Author's note: Keep it tense.]"));
+});
+
+test("Write my next line drafts into the composer, not the transcript", async () => {
+  requests.length = 0;
+  nextReply = "Corwin Ash: I pocket the map before she can stop me.";
+  $("#composer-input").value = "";
+  click($("#composer-more"));
+  await settled();
+  const item = [...topSheet().querySelectorAll(".menu-label")]
+    .find((label) => label.textContent === "Write my next line for me")
+    .closest("button");
+  click(item);
+  await settled();
+  await settled();
+
+  assert.equal(
+    $("#composer-input").value,
+    "I pocket the map before she can stop me.",
+  );
+  assert.equal(document.querySelectorAll("#transcript .message").length, 1);
+  assert.match(requests[0].messages.at(-1).content, /draft the next message for Corwin Ash/);
+  assert.equal("stop" in requests[0], false);
 });

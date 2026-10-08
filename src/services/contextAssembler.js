@@ -71,6 +71,7 @@ export function assembleContext({
   const systemSections = [
     "You are a collaborative long-form roleplay and narrative writing partner. Preserve continuity, honor established canon, and advance the scene with vivid but controlled prose. Do not decide the user's character's private thoughts or choices unless explicitly invited.",
     "Messages wrapped in [OOC: ...] are out-of-character instructions from the user. Follow them when writing your next reply, but never mention them or respond to them inside the story itself.",
+    "An [Author's note: ...] near the end of the conversation is the user's current direction for the scene. Let it shape your next reply without mentioning it.",
     userInstructions ? `USER INSTRUCTIONS\n${userInstructions}` : "",
     branch.summary ? `STORY SO FAR\n${branch.summary}` : "",
     player
@@ -88,9 +89,15 @@ export function assembleContext({
     content: systemSections.join("\n\n"),
   };
   const recentMessages = recentSlice.map(toApiMessage);
-  const messages = fitToCharacterBudget(
-    [systemMessage, ...recentMessages],
-    characterBudget,
+  const authorNote = branch.author_note?.trim()
+    ? { role: "user", content: `[Author's note: ${branch.author_note.trim()}]` }
+    : null;
+  const messages = placeAuthorNote(
+    fitToCharacterBudget(
+      [systemMessage, ...recentMessages],
+      characterBudget - (authorNote?.content.length ?? 0),
+    ),
+    authorNote,
   );
 
   return {
@@ -130,6 +137,11 @@ function formatCharacters(characters, canon, includeHidden) {
         character.description && `Description: ${character.description}`,
         character.personality && `Personality: ${character.personality}`,
         character.speech_style && `Speech: ${character.speech_style}`,
+        character.example_dialogue &&
+          `Example dialogue:\n    ${character.example_dialogue
+            .trim()
+            .split("\n")
+            .join("\n    ")}`,
         character.goals && `Goals: ${character.goals}`,
         character.relationships && `Relationships: ${character.relationships}`,
         character.current_emotional_state &&
@@ -164,11 +176,79 @@ function toApiMessage(message) {
   if (role === "character") {
     role = "user";
   }
+  if (role === "assistant") {
+    // The model's own turns go back unlabelled. Prefixing them with
+    // "Narrator: " taught the model to open replies that way, and each
+    // labelled reply was then re-prefixed, compounding into
+    // "Narrator: Narrator: ..." over a long chat.
+    return { role, content: stripNarratorLabel(message.content) };
+  }
   const prefix = message.speaker_name ? `${message.speaker_name}: ` : "";
   return {
-    role: ["system", "user", "assistant"].includes(role) ? role : "user",
+    role: ["system", "user"].includes(role) ? role : "user",
     content: `${prefix}${message.content}`,
   };
+}
+
+/** Remove a leading "Name:" label (plain or bolded) for the given speaker. */
+export function stripSpeakerLabel(text, name) {
+  const value = String(text ?? "");
+  const trimmed = String(name || "").trim();
+  if (!trimmed) return value;
+  const label = new RegExp(
+    `^\\s*\\**${escapeRegExp(trimmed)}\\**\\s*:\\s*\\**\\s*`,
+    "i",
+  );
+  const stripped = value.replace(label, "");
+  return stripped.trim() ? stripped : value;
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const NARRATOR_LABEL = /^(?:\s*\*{0,2}(?:narrator|assistant)\*{0,2}\s*:\s*\*{0,2})+\s*/i;
+
+/**
+ * Remove any run of leading "Narrator:" / "Assistant:" labels a model put at
+ * the start of its reply. Text that is nothing but a label is left alone.
+ */
+export function stripNarratorLabel(text) {
+  const value = String(text ?? "");
+  const stripped = value.replace(NARRATOR_LABEL, "");
+  return stripped.trim() ? stripped : value;
+}
+
+// Instructions at the top of a long prompt lose their pull as the chat grows;
+// the author's note sits just before the newest message, where the model is
+// paying the most attention.
+function placeAuthorNote(messages, note) {
+  if (!note) return messages;
+  if (messages.length < 2) return [...messages, note];
+  return [...messages.slice(0, -1), note, messages.at(-1)];
+}
+
+/**
+ * Stop sequences that end a reply when the model starts writing the user's
+ * own turn. Providers that ignore `stop` are covered by cutAtSpeaker.
+ */
+export function userStopSequences(name) {
+  const trimmed = String(name || "").trim();
+  if (!trimmed) return [];
+  return [`\n${trimmed}:`, `\n**${trimmed}:**`, `\n**${trimmed}**:`];
+}
+
+/** Drop everything from the first line where the model speaks as `name`. */
+export function cutAtSpeaker(text, name) {
+  const value = String(text ?? "");
+  const trimmed = String(name || "").trim();
+  if (!trimmed) return value;
+  const match = new RegExp(
+    `\\n\\s*\\**${escapeRegExp(trimmed)}\\**\\s*:`,
+  ).exec(value);
+  if (!match) return value;
+  const kept = value.slice(0, match.index).trimEnd();
+  return kept || value;
 }
 
 function fitToCharacterBudget(messages, budget) {

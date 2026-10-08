@@ -83,3 +83,36 @@ export async function idbRemove(key) {
   tx.objectStore(STORE_NAME).delete(key);
   await done;
 }
+
+export async function idbGetMany(keys) {
+  const db = await openDb();
+  const tx = db.transaction(STORE_NAME, "readonly");
+  const store = tx.objectStore(STORE_NAME);
+  return Promise.all(keys.map((key) => requestToPromise(store.get(key))));
+}
+
+/**
+ * Read `checkKey` and, only if `isExpected(value)` holds, write every
+ * [key, value] pair — all in one readwrite transaction, so no other tab can
+ * write in between. Resolves to whether the writes happened.
+ */
+export async function idbCompareAndSet(checkKey, isExpected, entries) {
+  const db = await openDb();
+  const tx = db.transaction(STORE_NAME, "readwrite");
+  const store = tx.objectStore(STORE_NAME);
+  let wrote = false;
+  const done = new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve(wrote);
+    tx.onerror = () => reject(tx.error || new Error("IndexedDB write failed."));
+    tx.onabort = () => reject(tx.error || new Error("IndexedDB write aborted."));
+  });
+  const read = store.get(checkKey);
+  read.onsuccess = () => {
+    if (!isExpected(read.result)) return;
+    for (const [key, value] of entries) {
+      store.put(value, key);
+    }
+    wrote = true;
+  };
+  return done;
+}

@@ -314,6 +314,15 @@ export function worldScreen({ project, onChange, confirm }) {
         placeholder: "Clipped sentences, never swears, calls everyone 'friend'…",
       }),
       textareaField({
+        label: "Example dialogue",
+        name: "example_dialogue",
+        value: entity.example_dialogue,
+        rows: 4,
+        placeholder:
+          "\"You're late.\" *She doesn't look up from the map.* \"Sit. Touch nothing.\"",
+        hint: "A few lines in their voice. The AI copies examples far more closely than descriptions.",
+      }),
+      textareaField({
         label: "What they want",
         name: "goals",
         value: entity.goals,
@@ -485,6 +494,7 @@ export function worldScreen({ project, onChange, confirm }) {
         description: values.description,
         personality: values.personality,
         speech_style: values.speech_style,
+        example_dialogue: values.example_dialogue,
         goals: values.goals,
         aliases: toStringArray(values.aliases),
         relationships: values.relationships,

@@ -1,4 +1,5 @@
-import { chipField } from "./formFields.js";
+import { nowIso } from "../utils/id.js";
+import { chipField, textareaField } from "./formFields.js";
 
 /**
  * "Who is in this scene, and where are we." This used to be buried in a
@@ -6,9 +7,9 @@ import { chipField } from "./formFields.js";
  * the one part of that panel worth touching mid-scene, so it gets its own
  * screen one tap from the transcript.
  *
- * @param {{project: object, onChange: () => void}} deps
+ * @param {{project: object, branch: object, onChange: () => void}} deps
  */
-export function sceneScreen({ project, onChange }) {
+export function sceneScreen({ project, branch, onChange }) {
   return {
     title: "The scene",
     render(body) {
@@ -50,6 +51,25 @@ export function sceneScreen({ project, onChange }) {
           },
         }),
       );
+
+      const note = textareaField({
+        label: "Author's note",
+        name: "author_note",
+        value: branch.author_note,
+        rows: 3,
+        placeholder: "Keep it tense. Mara is hiding something and lies badly.",
+        hint: "Direction for the scene right now. It sits just before your latest message, so it outweighs the story instructions — keep it short. This branch only.",
+      });
+      // Saved as you type: closing the sheet doesn't reliably blur the field,
+      // so waiting for a change event could drop the last edit.
+      let saveTimer;
+      note.querySelector("textarea").addEventListener("input", (event) => {
+        branch.author_note = event.target.value.trim();
+        branch.updated_at = nowIso();
+        clearTimeout(saveTimer);
+        saveTimer = setTimeout(onChange, 400);
+      });
+      form.append(note);
 
       body.append(form);
     },
